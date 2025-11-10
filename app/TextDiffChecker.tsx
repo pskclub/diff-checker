@@ -644,11 +644,11 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
                   </div>
                   
                   <div className="flex gap-2">
-                    <button onClick={exportToHTML} className="flex items-center gap-2 px-3 py-2 bg-slate-100 hover:bg-slate-200 rounded-lg text-sm transition">
+                    <button onClick={exportToHTML} className="flex items-center gap-2 px-3 py-2 bg-green-500 hover:bg-green-300 rounded-lg text-sm transition">
                       <Download size={16} />
                       <span>Export</span>
                     </button>
-                    <button onClick={copyDiffToClipboard} className="flex items-center gap-2 px-3 py-2 bg-slate-100 hover:bg-slate-200 rounded-lg text-sm transition">
+                    <button onClick={copyDiffToClipboard} className="flex items-center gap-2 px-3 py-2 bg-blue-500 hover:bg-blue-300 rounded-lg text-sm transition">
                       {copied ? <Check size={16} className="text-green-600" /> : <Copy size={16} />}
                       <span>{copied ? 'Copied!' : 'Copy'}</span>
                     </button>
