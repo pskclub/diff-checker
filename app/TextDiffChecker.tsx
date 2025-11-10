@@ -501,8 +501,38 @@ const TextDiffChecker: React.FC = () => {
 
   // Improved character-level diff using Myers algorithm for better accuracy
   const getCharacterDiff = (str1: string, str2: string): CharDiff[] => {
-    const len1 = str1.length;
-    const len2 = str2.length;
+    // If ignoreWhitespace is enabled, normalize strings by removing all whitespace
+    let normalizedStr1 = str1;
+    let normalizedStr2 = str2;
+    let mapping1: number[] = []; // Maps normalized index to original index
+    let mapping2: number[] = [];
+
+    if (ignoreWhitespace) {
+      // Create normalized strings and mappings
+      normalizedStr1 = '';
+      normalizedStr2 = '';
+
+      for (let i = 0; i < str1.length; i++) {
+        if (!/\s/.test(str1[i])) {
+          mapping1.push(i);
+          normalizedStr1 += str1[i];
+        }
+      }
+
+      for (let i = 0; i < str2.length; i++) {
+        if (!/\s/.test(str2[i])) {
+          mapping2.push(i);
+          normalizedStr2 += str2[i];
+        }
+      }
+    } else {
+      // No normalization, direct mapping
+      mapping1 = Array.from({ length: str1.length }, (_, i) => i);
+      mapping2 = Array.from({ length: str2.length }, (_, i) => i);
+    }
+
+    const len1 = normalizedStr1.length;
+    const len2 = normalizedStr2.length;
     const max = len1 + len2;
     const v: Map<number, number> = new Map();
     const trace: Map<number, number>[] = [];
@@ -525,7 +555,7 @@ const TextDiffChecker: React.FC = () => {
 
         let y = x - k;
 
-        while (x < len1 && y < len2 && str1[x] === str2[y]) {
+        while (x < len1 && y < len2 && normalizedStr1[x] === normalizedStr2[y]) {
           x++;
           y++;
         }
@@ -533,20 +563,24 @@ const TextDiffChecker: React.FC = () => {
         v.set(k, x);
 
         if (x >= len1 && y >= len2) {
-          return backtrackCharDiff(str1, str2, trace, len1, len2);
+          return backtrackCharDiff(str1, str2, normalizedStr1, normalizedStr2, trace, len1, len2, mapping1, mapping2);
         }
       }
     }
 
-    return backtrackCharDiff(str1, str2, trace, len1, len2);
+    return backtrackCharDiff(str1, str2, normalizedStr1, normalizedStr2, trace, len1, len2, mapping1, mapping2);
   };
 
   const backtrackCharDiff = (
     str1: string,
     str2: string,
+    normalizedStr1: string,
+    normalizedStr2: string,
     trace: Map<number, number>[],
     len1: number,
-    len2: number
+    len2: number,
+    mapping1: number[],
+    mapping2: number[]
   ): CharDiff[] => {
     const result: CharDiff[] = [];
     let x = len1;
@@ -561,17 +595,21 @@ const TextDiffChecker: React.FC = () => {
       const prevY = prevX - prevK;
 
       while (x > prevX && y > prevY) {
-        result.unshift({ type: 'equal', char: str1[x - 1] });
+        // Use original strings for display
+        const originalIdx1 = mapping1[x - 1];
+        result.unshift({ type: 'equal', char: str1[originalIdx1] });
         x--;
         y--;
       }
 
       if (d > 0) {
         if (x > prevX) {
-          result.unshift({ type: 'removed', char: str1[x - 1] });
+          const originalIdx1 = mapping1[x - 1];
+          result.unshift({ type: 'removed', char: str1[originalIdx1] });
           x--;
         } else if (y > prevY) {
-          result.unshift({ type: 'added', char: str2[y - 1] });
+          const originalIdx2 = mapping2[y - 1];
+          result.unshift({ type: 'added', char: str2[originalIdx2] });
           y--;
         }
       }
@@ -634,6 +672,31 @@ const TextDiffChecker: React.FC = () => {
       }
     }
 
+    // Filter out whitespace-only differences when ignoreWhitespace is enabled
+    const finalDiff = ignoreWhitespace
+      ? processedDiff.filter(item => {
+          // Keep equal lines
+          if (item.type === 'equal') return true;
+
+          // For modified lines, check if there are any non-whitespace differences
+          if (item.type === 'modified' && item.charDiff) {
+            const hasNonWhitespaceDiff = item.charDiff.some(c =>
+              (c.type === 'added' || c.type === 'removed') && !/\s/.test(c.char)
+            );
+            return hasNonWhitespaceDiff;
+          }
+
+          // For added/removed lines, check if the lines differ in non-whitespace content
+          if (item.type === 'added' || item.type === 'removed') {
+            const line = item.line1 || item.line2 || '';
+            // Keep the line if it has non-whitespace content
+            return line.trim().length > 0;
+          }
+
+          return true;
+        })
+      : processedDiff;
+
     // Improved hunk grouping - similar to git's context handling
     const grouped: DiffHunk[] = [];
     const CONTEXT_SIZE = 3;
@@ -643,8 +706,8 @@ const TextDiffChecker: React.FC = () => {
     let changes: DiffLine[] = [];
     let consecutiveEqualLines = 0;
 
-    for (let k = 0; k < processedDiff.length; k++) {
-      const item = processedDiff[k];
+    for (let k = 0; k < finalDiff.length; k++) {
+      const item = finalDiff[k];
 
       if (item.type === 'equal') {
         if (changes.length > 0) {
@@ -657,8 +720,8 @@ const TextDiffChecker: React.FC = () => {
             const startIdx = k - consecutiveEqualLines + 1;
 
             for (let l = startIdx; l < Math.min(startIdx + CONTEXT_SIZE, k + 1); l++) {
-              if (processedDiff[l] && processedDiff[l].type === 'equal') {
-                afterContext.push(processedDiff[l]);
+              if (finalDiff[l] && finalDiff[l].type === 'equal') {
+                afterContext.push(finalDiff[l]);
               }
             }
 
@@ -959,6 +1022,19 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
     return text.replace(/ /g, '·').replace(/\t/g, '→   ');
   };
 
+  // Filter whitespace differences when ignoreWhitespace is enabled
+  const filterWhitespaceDiff = (charDiff: CharDiff[]): CharDiff[] => {
+    if (!ignoreWhitespace) return charDiff;
+
+    return charDiff.filter(item => {
+      // If it's a whitespace character and it's added or removed, filter it out
+      if (/\s/.test(item.char) && (item.type === 'added' || item.type === 'removed')) {
+        return false;
+      }
+      return true;
+    });
+  };
+
   const renderCharacterDiff = (charDiff: CharDiff[]): React.ReactElement[] => {
     return charDiff.map((item, idx) => {
       const char = visualizeWhitespace(item.char);
@@ -1122,7 +1198,7 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
             <div className="mt-4 flex gap-4 flex-wrap">
               <label className="flex items-center gap-2 cursor-pointer">
                 <input type="checkbox" checked={ignoreWhitespace} onChange={(e) => setIgnoreWhitespace(e.target.checked)} className="w-4 h-4 text-blue-600 rounded" />
-                <span className="text-sm text-slate-700">Ignore whitespace</span>
+                <span className="text-sm text-slate-700">Ignore whitespace (spaces, tabs, etc.)</span>
               </label>
               <label className="flex items-center gap-2 cursor-pointer">
                 <input type="checkbox" checked={ignoreEmptyLines} onChange={(e) => setIgnoreEmptyLines(e.target.checked)} className="w-4 h-4 text-blue-600 rounded" />
@@ -1316,11 +1392,11 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
                                 <div>
                                   <div className="text-red-300 mb-1">
                                     <span className="inline-block w-6 text-red-400">-</span>
-                                    {renderCharacterDiff(change.charDiff.filter(c => c.type !== 'added'))}
+                                    {renderCharacterDiff((change.charDiff).filter(c => c.type !== 'added'))}
                                   </div>
                                   <div className="text-green-300">
                                     <span className="inline-block w-6 text-green-400">+</span>
-                                    {renderCharacterDiff(change.charDiff.filter(c => c.type !== 'removed'))}
+                                    {renderCharacterDiff((change.charDiff).filter(c => c.type !== 'removed'))}
                                   </div>
                                 </div>
                               ) : (
