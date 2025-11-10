@@ -4,7 +4,6 @@ import React, { useState } from 'react';
 import { Upload, FileText, X, AlertCircle, Search, Download, Copy, Check } from 'lucide-react';
 import * as mammoth from 'mammoth';
 import { PDFParse } from 'pdf-parse'
-import { flushSync } from 'react-dom';
 PDFParse.setWorker('https://cdn.jsdelivr.net/npm/pdf-parse@latest/dist/pdf-parse/web/pdf.worker.mjs');
 // Type definitions
 type FileType = 'txt' | 'docx' | 'pdf' | 'md';
@@ -66,6 +65,7 @@ interface SavedSession {
   file2Name?: string;
   ignoreWhitespace: boolean;
   showWhitespace: boolean;
+  ignoreEmptyLines?: boolean;
 }
 
 const TextDiffChecker: React.FC = () => {
@@ -83,6 +83,7 @@ const TextDiffChecker: React.FC = () => {
   const [currentSearchIndex, setCurrentSearchIndex] = useState<number>(0);
   const [ignoreWhitespace, setIgnoreWhitespace] = useState<boolean>(true);
   const [showWhitespace, setShowWhitespace] = useState<boolean>(false);
+  const [ignoreEmptyLines, setIgnoreEmptyLines] = useState<boolean>(true);
   const [copied, setCopied] = useState<boolean>(false);
   const [inputMode1, setInputMode1] = useState<InputMode>('file');
   const [inputMode2, setInputMode2] = useState<InputMode>('file');
@@ -167,6 +168,7 @@ const TextDiffChecker: React.FC = () => {
       file2Name: file2?.name,
       ignoreWhitespace,
       showWhitespace,
+      ignoreEmptyLines,
     };
 
     const updatedSessions = [newSession, ...savedSessions].slice(0, 10); // Keep only last 10 sessions
@@ -181,6 +183,7 @@ const TextDiffChecker: React.FC = () => {
     setText2(session.text2);
     setIgnoreWhitespace(session.ignoreWhitespace);
     setShowWhitespace(session.showWhitespace);
+    setIgnoreEmptyLines(session.ignoreEmptyLines || false);
     setFile1(null);
     setFile2(null);
     setInputMode1('text');
@@ -210,164 +213,309 @@ const TextDiffChecker: React.FC = () => {
     return line;
   };
 
-  const getLCS = (arr1: string[], arr2: string[]): number[][] => {
+  // Myers diff algorithm - similar to what git uses
+  const myersDiff = (arr1: string[], arr2: string[]): DiffLine[] => {
     const m = arr1.length;
     const n = arr2.length;
-    const dp: number[][] = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+    const max = m + n;
+    const v: Map<number, number> = new Map();
+    const trace: Map<number, number>[] = [];
 
-    for (let i = 1; i <= m; i++) {
-      for (let j = 1; j <= n; j++) {
-        if (normalizeForComparison(arr1[i - 1]) === normalizeForComparison(arr2[j - 1])) {
-          dp[i][j] = dp[i - 1][j - 1] + 1;
+    v.set(1, 0);
+
+    for (let d = 0; d <= max; d++) {
+      trace.push(new Map(v));
+
+      for (let k = -d; k <= d; k += 2) {
+        let x: number;
+
+        const goDown = k === -d || (k !== d && (v.get(k - 1) || 0) < (v.get(k + 1) || 0));
+
+        if (goDown) {
+          x = v.get(k + 1) || 0;
         } else {
-          dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+          x = (v.get(k - 1) || 0) + 1;
+        }
+
+        let y = x - k;
+
+        while (x < m && y < n && normalizeForComparison(arr1[x]) === normalizeForComparison(arr2[y])) {
+          x++;
+          y++;
+        }
+
+        v.set(k, x);
+
+        if (x >= m && y >= n) {
+          return backtrackMyers(arr1, arr2, trace, m, n);
         }
       }
     }
 
-    return dp;
+    return backtrackMyers(arr1, arr2, trace, m, n);
   };
 
+  const backtrackMyers = (
+    arr1: string[],
+    arr2: string[],
+    trace: Map<number, number>[],
+    m: number,
+    n: number
+  ): DiffLine[] => {
+    const diff: DiffLine[] = [];
+    let x = m;
+    let y = n;
+
+    for (let d = trace.length - 1; d >= 0; d--) {
+      const v = trace[d];
+      const k = x - y;
+
+      const prevK = (k === -d || (k !== d && (v.get(k - 1) || 0) < (v.get(k + 1) || 0))) ? k + 1 : k - 1;
+      const prevX = v.get(prevK) || 0;
+      const prevY = prevX - prevK;
+
+      while (x > prevX && y > prevY) {
+        diff.unshift({
+          type: 'equal',
+          line1: arr1[x - 1],
+          line2: arr2[y - 1],
+          lineNum1: x,
+          lineNum2: y
+        });
+        x--;
+        y--;
+      }
+
+      if (d > 0) {
+        if (x > prevX) {
+          diff.unshift({
+            type: 'removed',
+            line1: arr1[x - 1],
+            line2: null,
+            lineNum1: x,
+            lineNum2: null
+          });
+          x--;
+        } else if (y > prevY) {
+          diff.unshift({
+            type: 'added',
+            line1: null,
+            line2: arr2[y - 1],
+            lineNum1: null,
+            lineNum2: y
+          });
+          y--;
+        }
+      }
+    }
+
+    return diff;
+  };
+
+  // Improved character-level diff using Myers algorithm for better accuracy
   const getCharacterDiff = (str1: string, str2: string): CharDiff[] => {
     const len1 = str1.length;
     const len2 = str2.length;
-    const dp: number[][] = Array(len1 + 1).fill(null).map(() => Array(len2 + 1).fill(0));
+    const max = len1 + len2;
+    const v: Map<number, number> = new Map();
+    const trace: Map<number, number>[] = [];
 
-    for (let i = 1; i <= len1; i++) {
-      for (let j = 1; j <= len2; j++) {
-        if (str1[i - 1] === str2[j - 1]) {
-          dp[i][j] = dp[i - 1][j - 1] + 1;
+    v.set(1, 0);
+
+    for (let d = 0; d <= max; d++) {
+      trace.push(new Map(v));
+
+      for (let k = -d; k <= d; k += 2) {
+        let x: number;
+
+        const goDown = k === -d || (k !== d && (v.get(k - 1) || 0) < (v.get(k + 1) || 0));
+
+        if (goDown) {
+          x = v.get(k + 1) || 0;
         } else {
-          dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+          x = (v.get(k - 1) || 0) + 1;
+        }
+
+        let y = x - k;
+
+        while (x < len1 && y < len2 && str1[x] === str2[y]) {
+          x++;
+          y++;
+        }
+
+        v.set(k, x);
+
+        if (x >= len1 && y >= len2) {
+          return backtrackCharDiff(str1, str2, trace, len1, len2);
         }
       }
     }
 
-    const result: CharDiff[] = [];
-    let i = len1;
-    let j = len2;
+    return backtrackCharDiff(str1, str2, trace, len1, len2);
+  };
 
-    while (i > 0 || j > 0) {
-      if (i > 0 && j > 0 && str1[i - 1] === str2[j - 1]) {
-        result.unshift({ type: 'equal', char: str1[i - 1] });
-        i--;
-        j--;
-      } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
-        result.unshift({ type: 'added', char: str2[j - 1] });
-        j--;
-      } else if (i > 0) {
-        result.unshift({ type: 'removed', char: str1[i - 1] });
-        i--;
+  const backtrackCharDiff = (
+    str1: string,
+    str2: string,
+    trace: Map<number, number>[],
+    len1: number,
+    len2: number
+  ): CharDiff[] => {
+    const result: CharDiff[] = [];
+    let x = len1;
+    let y = len2;
+
+    for (let d = trace.length - 1; d >= 0; d--) {
+      const v = trace[d];
+      const k = x - y;
+
+      const prevK = (k === -d || (k !== d && (v.get(k - 1) || 0) < (v.get(k + 1) || 0))) ? k + 1 : k - 1;
+      const prevX = v.get(prevK) || 0;
+      const prevY = prevX - prevK;
+
+      while (x > prevX && y > prevY) {
+        result.unshift({ type: 'equal', char: str1[x - 1] });
+        x--;
+        y--;
+      }
+
+      if (d > 0) {
+        if (x > prevX) {
+          result.unshift({ type: 'removed', char: str1[x - 1] });
+          x--;
+        } else if (y > prevY) {
+          result.unshift({ type: 'added', char: str2[y - 1] });
+          y--;
+        }
       }
     }
 
     return result;
   };
 
+  // Improved similarity check for detecting modified lines
+  const calculateSimilarity = (str1: string, str2: string): number => {
+    const len1 = str1.length;
+    const len2 = str2.length;
+    if (len1 === 0 && len2 === 0) return 1;
+    if (len1 === 0 || len2 === 0) return 0;
+
+    const maxLen = Math.max(len1, len2);
+    const charDiff = getCharacterDiff(str1, str2);
+    const equalChars = charDiff.filter(c => c.type === 'equal').length;
+
+    return equalChars / maxLen;
+  };
+
   const buildDiff = (lines1: string[], lines2: string[]): DiffHunk[] => {
-    const dp = getLCS(lines1, lines2);
-    const diff: DiffLine[] = [];
-    let i = lines1.length;
-    let j = lines2.length;
+    // Use Myers algorithm for better diff quality
+    const diff = myersDiff(lines1, lines2);
 
-    while (i > 0 || j > 0) {
-      if (i > 0 && j > 0 && normalizeForComparison(lines1[i - 1]) === normalizeForComparison(lines2[j - 1])) {
-        diff.unshift({
-          type: 'equal',
-          line1: lines1[i - 1],
-          line2: lines2[j - 1],
-          lineNum1: i,
-          lineNum2: j
-        });
-        i--;
-        j--;
-      } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
-        diff.unshift({
-          type: 'added',
-          line1: null,
-          line2: lines2[j - 1],
-          lineNum1: null,
-          lineNum2: j
-        });
-        j--;
-      } else if (i > 0) {
-        diff.unshift({
-          type: 'removed',
-          line1: lines1[i - 1],
-          line2: null,
-          lineNum1: i,
-          lineNum2: null
-        });
-        i--;
-      }
-    }
-
+    // Improved modified line detection with similarity threshold
     const processedDiff: DiffLine[] = [];
+    const SIMILARITY_THRESHOLD = 0.4; // Lines with >40% similarity are considered modified
+
     for (let k = 0; k < diff.length; k++) {
       const current = diff[k];
       const next = diff[k + 1];
 
+      // Check if consecutive removed and added lines should be merged as modified
       if (current.type === 'removed' && next && next.type === 'added' && current.line1 && next.line2) {
-        const charDiff = getCharacterDiff(current.line1, next.line2);
-        processedDiff.push({
-          type: 'modified',
-          line1: current.line1,
-          line2: next.line2,
-          lineNum1: current.lineNum1,
-          lineNum2: next.lineNum2,
-          charDiff
-        });
-        k++;
+        const similarity = calculateSimilarity(
+          normalizeForComparison(current.line1),
+          normalizeForComparison(next.line2)
+        );
+
+        // Only merge if lines are similar enough
+        if (similarity >= SIMILARITY_THRESHOLD) {
+          const charDiff = getCharacterDiff(current.line1, next.line2);
+          processedDiff.push({
+            type: 'modified',
+            line1: current.line1,
+            line2: next.line2,
+            lineNum1: current.lineNum1,
+            lineNum2: next.lineNum2,
+            charDiff
+          });
+          k++; // Skip next item
+        } else {
+          // Lines are too different, keep them separate
+          processedDiff.push(current);
+        }
       } else {
         processedDiff.push(current);
       }
     }
 
+    // Improved hunk grouping - similar to git's context handling
     const grouped: DiffHunk[] = [];
+    const CONTEXT_SIZE = 3;
+    const MERGE_DISTANCE = 6; // Merge hunks if they're within 6 lines of each other
+
     let contextBefore: DiffLine[] = [];
     let changes: DiffLine[] = [];
+    let consecutiveEqualLines = 0;
 
     for (let k = 0; k < processedDiff.length; k++) {
       const item = processedDiff[k];
 
       if (item.type === 'equal') {
         if (changes.length > 0) {
-          const beforeContext = contextBefore.slice(-3);
-          const afterContext: DiffLine[] = [];
+          consecutiveEqualLines++;
 
-          let afterCount = 0;
-          for (let l = k; l < processedDiff.length && afterCount < 3; l++) {
-            if (processedDiff[l].type === 'equal') {
-              afterContext.push(processedDiff[l]);
-              afterCount++;
-            } else {
-              break;
+          // Check if we should close the current hunk or continue
+          if (consecutiveEqualLines > MERGE_DISTANCE) {
+            // Close current hunk
+            const afterContext: DiffLine[] = [];
+            const startIdx = k - consecutiveEqualLines + 1;
+
+            for (let l = startIdx; l < Math.min(startIdx + CONTEXT_SIZE, k + 1); l++) {
+              if (processedDiff[l] && processedDiff[l].type === 'equal') {
+                afterContext.push(processedDiff[l]);
+              }
             }
+
+            grouped.push({
+              type: 'hunk',
+              beforeContext: contextBefore.slice(-CONTEXT_SIZE),
+              changes,
+              afterContext
+            });
+
+            // Reset for next hunk
+            changes = [];
+            contextBefore = [];
+            consecutiveEqualLines = 0;
+          } else {
+            // Add equal line to changes (will be part of the hunk)
+            changes.push(item);
           }
-
-          grouped.push({
-            type: 'hunk',
-            beforeContext,
-            changes,
-            afterContext
-          });
-
-          changes = [];
-          contextBefore = [item];
         } else {
+          // No changes yet, accumulate context
           contextBefore.push(item);
+          consecutiveEqualLines = 0;
         }
       } else {
+        // Found a change
+        consecutiveEqualLines = 0;
         changes.push(item);
       }
     }
 
+    // Close final hunk if there are pending changes
     if (changes.length > 0) {
+      // Remove trailing equal lines from changes and use as after context
+      const afterContext: DiffLine[] = [];
+      while (changes.length > 0 && changes[changes.length - 1].type === 'equal') {
+        const line = changes.pop();
+        if (line) afterContext.unshift(line);
+      }
+
       grouped.push({
         type: 'hunk',
-        beforeContext: contextBefore.slice(-3),
+        beforeContext: contextBefore.slice(-CONTEXT_SIZE),
         changes,
-        afterContext: []
+        afterContext: afterContext.slice(0, CONTEXT_SIZE)
       });
     }
 
@@ -377,6 +525,8 @@ const TextDiffChecker: React.FC = () => {
   const computeDiff = (session ?: SavedSession): void => {
     const t1 = session ? session.text1 : text1;
     const t2 = session ? session.text2 : text2;
+    const shouldIgnoreEmptyLines = session ? (session.ignoreEmptyLines || false) : ignoreEmptyLines;
+
     if (!t1 || !t2) {
       setError('กรุณาเลือกไฟล์หรือใส่ข้อความทั้งสองฝั่ง');
       return;
@@ -385,16 +535,36 @@ const TextDiffChecker: React.FC = () => {
     const allLines1 = t1.split('\n');
     const allLines2 = t2.split('\n');
 
-    const lines1WithNum: LineWithNum[] = allLines1.map((line, idx) => ({ line, originalLineNum: idx + 1 }))
-      .filter(item => item.line.trim() !== '');
-    const lines2WithNum: LineWithNum[] = allLines2.map((line, idx) => ({ line, originalLineNum: idx + 1 }))
-      .filter(item => item.line.trim() !== '');
+    // Create mapping for line numbers
+    let lines1WithNum: LineWithNum[];
+    let lines2WithNum: LineWithNum[];
+
+    if (shouldIgnoreEmptyLines) {
+      // Filter out empty lines but keep track of original line numbers
+      lines1WithNum = allLines1
+        .map((line, idx) => ({ line, originalLineNum: idx + 1 }))
+        .filter(item => item.line.trim() !== '');
+      lines2WithNum = allLines2
+        .map((line, idx) => ({ line, originalLineNum: idx + 1 }))
+        .filter(item => item.line.trim() !== '');
+    } else {
+      // Keep all lines including empty ones
+      lines1WithNum = allLines1.map((line, idx) => ({
+        line,
+        originalLineNum: idx + 1
+      }));
+      lines2WithNum = allLines2.map((line, idx) => ({
+        line,
+        originalLineNum: idx + 1
+      }));
+    }
 
     const lines1 = lines1WithNum.map(item => item.line);
     const lines2 = lines2WithNum.map(item => item.line);
 
     const result = buildDiff(lines1, lines2);
 
+    // Map back to original line numbers
     result.forEach(hunk => {
       hunk.beforeContext = hunk.beforeContext.map((item): DiffLine => ({
         ...item,
@@ -767,11 +937,15 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
                 <input type="checkbox" checked={ignoreWhitespace} onChange={(e) => setIgnoreWhitespace(e.target.checked)} className="w-4 h-4 text-blue-600 rounded" />
                 <span className="text-sm text-slate-700">Ignore whitespace</span>
               </label>
-
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" checked={ignoreEmptyLines} onChange={(e) => setIgnoreEmptyLines(e.target.checked)} className="w-4 h-4 text-blue-600 rounded" />
+                <span className="text-sm text-slate-700">Ignore empty lines</span>
+              </label>
               <label className="flex items-center gap-2 cursor-pointer">
                 <input type="checkbox" checked={showWhitespace} onChange={(e) => setShowWhitespace(e.target.checked)} className="w-4 h-4 text-blue-600 rounded" />
                 <span className="text-sm text-slate-700">Show whitespace (· = space, → = tab)</span>
               </label>
+
             </div>
 
             <div className="mt-4 flex gap-2">
@@ -890,25 +1064,47 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
               {viewMode === 'diff' && (
                 <div className="border border-slate-200 rounded-lg overflow-hidden bg-slate-900">
                   <div className="max-h-[700px] overflow-y-auto">
-                    {diffResult.hunks.map((hunk, hunkIdx) => (
-                      <div key={hunkIdx} className="border-b border-slate-700 last:border-b-0">
-                        <div className="bg-slate-800 px-4 py-2 flex items-center justify-between">
-                          <span className="text-cyan-400 font-mono text-xs">@@ {hunk.changes[0]?.lineNum1 || hunk.changes[0]?.lineNum2} @@</span>
-                          <button onClick={() => {
-                            const lineNum = hunk.changes[0]?.originalLineNum1 || hunk.changes[0]?.originalLineNum2;
-                            if (lineNum) {
-                              setViewMode('original');
-                              setTimeout(() => scrollToLine(lineNum, true), 100);
-                            }
-                          }} className="text-xs text-cyan-400 hover:text-cyan-300 underline">
-                            ดู context
-                          </button>
-                        </div>
+                    {diffResult.hunks.map((hunk, hunkIdx) => {
+                      // Calculate hunk header like git: @@ -start,count +start,count @@
+                      const getHunkHeader = () => {
+                        const firstChange = hunk.changes[0];
+                        const lastChange = hunk.changes[hunk.changes.length - 1];
+
+                        // Get start line numbers (including before context)
+                        const startLine1 = hunk.beforeContext.length > 0
+                          ? hunk.beforeContext[0].originalLineNum1
+                          : firstChange?.originalLineNum1;
+                        const startLine2 = hunk.beforeContext.length > 0
+                          ? hunk.beforeContext[0].originalLineNum2
+                          : firstChange?.originalLineNum2;
+
+                        // Count total lines in this hunk for each side
+                        const allHunkLines = [...hunk.beforeContext, ...hunk.changes, ...hunk.afterContext];
+                        const count1 = allHunkLines.filter(l => l.lineNum1 !== null).length;
+                        const count2 = allHunkLines.filter(l => l.lineNum2 !== null).length;
+
+                        return `@@ -${startLine1 || 0},${count1} +${startLine2 || 0},${count2} @@`;
+                      };
+
+                      return (
+                        <div key={hunkIdx} className="border-b border-slate-700 last:border-b-0">
+                          <div className="bg-slate-800 px-4 py-2 flex items-center justify-between">
+                            <span className="text-cyan-400 font-mono text-xs">{getHunkHeader()}</span>
+                            <button onClick={() => {
+                              const lineNum = hunk.changes[0]?.originalLineNum1 || hunk.changes[0]?.originalLineNum2;
+                              if (lineNum) {
+                                setViewMode('original');
+                                setTimeout(() => scrollToLine(lineNum, true), 100);
+                              }
+                            }} className="text-xs text-cyan-400 hover:text-cyan-300 underline">
+                              ดู context
+                            </button>
+                          </div>
 
                         {!showOnlyDiff && hunk.beforeContext.map((line, idx) => (
                           <div key={`before-${idx}`} className="flex hover:bg-slate-800 transition">
-                            <div className="px-4 py-1 text-slate-500 font-mono text-xs w-12 text-right flex-shrink-0 select-none border-r border-slate-700">{line.lineNum1}</div>
-                            <div className="px-4 py-1 text-slate-500 font-mono text-xs w-12 text-right flex-shrink-0 select-none border-r border-slate-700">{line.lineNum2}</div>
+                            <div className="px-4 py-1 text-slate-500 font-mono text-xs w-12 text-right flex-shrink-0 select-none border-r border-slate-700">{line.originalLineNum1 || ''}</div>
+                            <div className="px-4 py-1 text-slate-500 font-mono text-xs w-12 text-right flex-shrink-0 select-none border-r border-slate-700">{line.originalLineNum2 || ''}</div>
                             <div className="px-4 py-1 font-mono text-sm text-slate-400 flex-1">{visualizeWhitespace(line.line1 || line.line2)}</div>
                           </div>
                         ))}
@@ -923,10 +1119,10 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
                             }
                           }}>
                             <div className={`px-4 py-1 font-mono text-xs w-12 text-right flex-shrink-0 select-none border-r ${change.type === 'removed' ? 'bg-red-900 text-red-300 border-red-800' : change.type === 'added' ? 'bg-green-900 text-green-300 border-green-800' : change.type === 'modified' ? 'bg-yellow-900 text-yellow-300 border-yellow-800' : 'text-slate-500 border-slate-700'}`}>
-                              {change.lineNum1 || ''}
+                              {change.originalLineNum1 || ''}
                             </div>
                             <div className={`px-4 py-1 font-mono text-xs w-12 text-right flex-shrink-0 select-none border-r ${change.type === 'removed' ? 'bg-red-900 text-red-300 border-red-800' : change.type === 'added' ? 'bg-green-900 text-green-300 border-green-800' : change.type === 'modified' ? 'bg-yellow-900 text-yellow-300 border-yellow-800' : 'text-slate-500 border-slate-700'}`}>
-                              {change.lineNum2 || ''}
+                              {change.originalLineNum2 || ''}
                             </div>
                             <div className={`px-2 py-1 font-mono text-sm flex-1 ${change.type === 'removed' ? 'text-red-300' : change.type === 'added' ? 'text-green-300' : change.type === 'modified' ? 'text-yellow-300' : 'text-slate-300'}`}>
                               {change.type === 'modified' && change.charDiff ? (
@@ -954,13 +1150,14 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
 
                         {!showOnlyDiff && hunk.afterContext.map((line, idx) => (
                           <div key={`after-${idx}`} className="flex hover:bg-slate-800 transition">
-                            <div className="px-4 py-1 text-slate-500 font-mono text-xs w-12 text-right flex-shrink-0 select-none border-r border-slate-700">{line.lineNum1}</div>
-                            <div className="px-4 py-1 text-slate-500 font-mono text-xs w-12 text-right flex-shrink-0 select-none border-r border-slate-700">{line.lineNum2}</div>
+                            <div className="px-4 py-1 text-slate-500 font-mono text-xs w-12 text-right flex-shrink-0 select-none border-r border-slate-700">{line.originalLineNum1 || ''}</div>
+                            <div className="px-4 py-1 text-slate-500 font-mono text-xs w-12 text-right flex-shrink-0 select-none border-r border-slate-700">{line.originalLineNum2 || ''}</div>
                             <div className="px-4 py-1 font-mono text-sm text-slate-400 flex-1">{visualizeWhitespace(line.line1 || line.line2)}</div>
                           </div>
                         ))}
-                      </div>
-                    ))}
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               )}
