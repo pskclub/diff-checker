@@ -3,8 +3,6 @@
 import React, { useState } from 'react';
 import { Upload, FileText, X, AlertCircle, Search, Download, Copy, Check } from 'lucide-react';
 import * as mammoth from 'mammoth';
-import { PDFParse } from 'pdf-parse'
-PDFParse.setWorker('https://cdn.jsdelivr.net/npm/pdf-parse@latest/dist/pdf-parse/web/pdf.worker.mjs');
 // Type definitions
 type FileType = 'txt' | 'docx' | 'pdf' | 'md';
 type ViewMode = 'diff' | 'original' | 'modified';
@@ -101,6 +99,197 @@ const TextDiffChecker: React.FC = () => {
     }
   }, []);
 
+  // Enhanced PDF text extraction with layout preservation
+  const extractTextFromPDF = async (arrayBuffer: ArrayBuffer): Promise<string> => {
+    try {
+      // Dynamic import to avoid SSR issues
+      const pdfjsLib = await import('pdfjs-dist');
+
+      // Configure worker - prefer local, fallback to CDN
+      if (typeof window !== 'undefined') {
+        // Try local worker first (faster and more reliable)
+        const localWorker = '/pdf.worker.min.mjs';
+        const cdnWorker = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+
+        // Check if local worker exists
+        try {
+          const response = await fetch(localWorker, { method: 'HEAD' });
+          if (response.ok) {
+            pdfjsLib.GlobalWorkerOptions.workerSrc = localWorker;
+          } else {
+            pdfjsLib.GlobalWorkerOptions.workerSrc = cdnWorker;
+          }
+        } catch {
+          // Fallback to CDN if local check fails
+          pdfjsLib.GlobalWorkerOptions.workerSrc = cdnWorker;
+        }
+      }
+
+      const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+      const pdf = await loadingTask.promise;
+      const textPages: string[] = [];
+
+      for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+        const page = await pdf.getPage(pageNum);
+        const textContent = await page.getTextContent();
+        const viewport = page.getViewport({ scale: 1.0 });
+
+        // Enhanced text item interface
+        interface TextItem {
+          str: string;
+          x: number;
+          y: number;
+          width: number;
+          height: number;
+          fontName?: string;
+        }
+
+        const items: TextItem[] = textContent.items
+          .filter((item): item is typeof item & { str: string; transform: number[]; width?: number; height?: number } =>
+            'str' in item && 'transform' in item
+          )
+          .map(item => ({
+            str: item.str,
+            x: item.transform[4],
+            y: viewport.height - item.transform[5], // Convert to top-down coordinates
+            width: ('width' in item && typeof item.width === 'number') ? item.width : 0,
+            height: ('height' in item && typeof item.height === 'number') ? item.height : 0,
+            fontName: 'fontName' in item ? String(item.fontName) : undefined,
+          }));
+
+        if (items.length === 0) continue;
+
+        // Detect columns by analyzing X positions
+        const xPositions = items.map(item => item.x).sort((a, b) => a - b);
+        const columnThreshold = 100; // Minimum gap to consider as column break
+        const columns: number[] = [0];
+
+        for (let i = 1; i < xPositions.length; i++) {
+          if (xPositions[i] - xPositions[i - 1] > columnThreshold) {
+            const avgX = (xPositions[i] + xPositions[i - 1]) / 2;
+            if (!columns.some(col => Math.abs(col - avgX) < 50)) {
+              columns.push(avgX);
+            }
+          }
+        }
+        columns.sort((a, b) => a - b);
+
+        // Assign items to columns
+        const itemsWithColumn = items.map(item => {
+          let columnIndex = 0;
+          for (let i = columns.length - 1; i >= 0; i--) {
+            if (item.x >= columns[i]) {
+              columnIndex = i;
+              break;
+            }
+          }
+          return { ...item, columnIndex };
+        });
+
+        // Sort by column, then Y position, then X position
+        itemsWithColumn.sort((a, b) => {
+          if (a.columnIndex !== b.columnIndex) {
+            return a.columnIndex - b.columnIndex;
+          }
+          const yDiff = Math.abs(a.y - b.y);
+          if (yDiff < 3) { // Same line threshold
+            return a.x - b.x;
+          }
+          return a.y - b.y;
+        });
+
+        // Build lines with enhanced spacing and indentation
+        const lines: string[] = [];
+        let currentLine = '';
+        let currentY = itemsWithColumn[0]?.y || 0;
+        let currentColumn = itemsWithColumn[0]?.columnIndex || 0;
+        let lastX = 0;
+        let lineStartX = itemsWithColumn[0]?.x || 0;
+
+        for (const item of itemsWithColumn) {
+          const yDiff = Math.abs(item.y - currentY);
+          const columnChanged = item.columnIndex !== currentColumn;
+
+          // New line if Y position changed significantly or column changed
+          if (yDiff > 3 || columnChanged) {
+            if (currentLine.trim()) {
+              lines.push(currentLine.trimEnd());
+            }
+            currentLine = '';
+            currentY = item.y;
+            currentColumn = item.columnIndex;
+            lastX = 0;
+            lineStartX = item.x;
+
+            // Add column separator if column changed
+            if (columnChanged && currentLine === '') {
+              lines.push(''); // Empty line between columns
+            }
+          }
+
+          // Calculate indentation for first item on line
+          if (currentLine === '') {
+            const indent = Math.floor((item.x - lineStartX) / 8); // Approximate character width
+            if (indent > 0 && indent < 20) { // Reasonable indentation range
+              currentLine = ' '.repeat(indent);
+            }
+            lineStartX = item.x;
+          }
+
+          // Add spacing between words on the same line
+          if (currentLine.trim() && item.x > lastX) {
+            const gap = item.x - lastX;
+
+            // Calculate number of spaces based on gap
+            if (gap > 5) {
+              const spaces = Math.min(Math.floor(gap / 4), 10); // Max 10 spaces
+              if (spaces > 0) {
+                currentLine += ' '.repeat(spaces);
+              }
+            }
+          }
+
+          // Add the text
+          currentLine += item.str;
+          lastX = item.x + item.width;
+        }
+
+        // Add the last line
+        if (currentLine.trim()) {
+          lines.push(currentLine.trimEnd());
+        }
+
+        // Post-process: Remove excessive blank lines
+        const processedLines: string[] = [];
+        let consecutiveBlankLines = 0;
+
+        for (const line of lines) {
+          if (line.trim() === '') {
+            consecutiveBlankLines++;
+            if (consecutiveBlankLines <= 2) { // Keep max 2 consecutive blank lines
+              processedLines.push(line);
+            }
+          } else {
+            consecutiveBlankLines = 0;
+            processedLines.push(line);
+          }
+        }
+
+        // Join lines and add page separator
+        const pageText = processedLines.join('\n');
+        if (pageText.trim()) {
+          textPages.push(pageText);
+        }
+      }
+
+      // Join all pages without page separator
+      return textPages.join('\n\n');
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+      throw new Error('ไม่สามารถอ่าน PDF ได้: ' + errorMessage);
+    }
+  };
+
   const extractTextFromFile = async (file: File): Promise<string> => {
     const fileType = file.name.split('.').pop()?.toLowerCase() as FileType | undefined;
 
@@ -113,9 +302,7 @@ const TextDiffChecker: React.FC = () => {
         return result.value;
       } else if (fileType === 'pdf') {
         const arrayBuffer = await file.arrayBuffer();
-        const parser = new PDFParse({ data: arrayBuffer });
-        const res = await parser.getText();
-        return res.pages.map((page) => page.text).join('\n');
+        return await extractTextFromPDF(arrayBuffer);
       }
       return '';
     } catch (err) {
