@@ -4,12 +4,14 @@ import React, { useState } from 'react';
 import { Upload, FileText, X, AlertCircle, Search, Download, Copy, Check } from 'lucide-react';
 import * as mammoth from 'mammoth';
 import { PDFParse } from 'pdf-parse'
+import { flushSync } from 'react-dom';
 PDFParse.setWorker('https://cdn.jsdelivr.net/npm/pdf-parse@latest/dist/pdf-parse/web/pdf.worker.mjs');
 // Type definitions
-type FileType = 'txt' | 'docx' | 'pdf';
+type FileType = 'txt' | 'docx' | 'pdf' | 'md';
 type ViewMode = 'diff' | 'original' | 'modified';
 type DiffType = 'equal' | 'added' | 'removed' | 'modified';
 type CharDiffType = 'equal' | 'added' | 'removed';
+type InputMode = 'file' | 'text';
 
 interface CharDiff {
   type: CharDiffType;
@@ -56,6 +58,16 @@ interface ChangeCount {
   removed: number;
 }
 
+interface SavedSession {
+  timestamp: number;
+  text1: string;
+  text2: string;
+  file1Name?: string;
+  file2Name?: string;
+  ignoreWhitespace: boolean;
+  showWhitespace: boolean;
+}
+
 const TextDiffChecker: React.FC = () => {
   const [file1, setFile1] = useState<File | null>(null);
   const [file2, setFile2] = useState<File | null>(null);
@@ -72,12 +84,27 @@ const TextDiffChecker: React.FC = () => {
   const [ignoreWhitespace, setIgnoreWhitespace] = useState<boolean>(false);
   const [showWhitespace, setShowWhitespace] = useState<boolean>(false);
   const [copied, setCopied] = useState<boolean>(false);
+  const [inputMode1, setInputMode1] = useState<InputMode>('file');
+  const [inputMode2, setInputMode2] = useState<InputMode>('file');
+  const [savedSessions, setSavedSessions] = useState<SavedSession[]>([]);
+
+  // Load saved sessions from localStorage on mount
+  React.useEffect(() => {
+    const saved = localStorage.getItem('diffCheckerSessions');
+    if (saved) {
+      try {
+        setSavedSessions(JSON.parse(saved));
+      } catch (e) {
+        console.error('Failed to load sessions:', e);
+      }
+    }
+  }, []);
 
   const extractTextFromFile = async (file: File): Promise<string> => {
     const fileType = file.name.split('.').pop()?.toLowerCase() as FileType | undefined;
 
     try {
-      if (fileType === 'txt') {
+      if (fileType === 'txt' || fileType === 'md') {
         return await file.text();
       } else if (fileType === 'docx') {
         const arrayBuffer = await file.arrayBuffer();
@@ -85,7 +112,7 @@ const TextDiffChecker: React.FC = () => {
         return result.value;
       } else if (fileType === 'pdf') {
         const arrayBuffer = await file.arrayBuffer();
-      	const parser = new PDFParse({ data: arrayBuffer });
+        const parser = new PDFParse({ data: arrayBuffer });
         const res = await parser.getText();
         return res.pages.map((page) => page.text).join('\n');
       }
@@ -103,11 +130,11 @@ const TextDiffChecker: React.FC = () => {
   ): Promise<void> => {
     if (!file) return;
 
-    const validTypes: FileType[] = ['txt', 'docx', 'pdf'];
+    const validTypes: FileType[] = ['txt', 'docx', 'pdf', 'md'];
     const fileType = file.name.split('.').pop()?.toLowerCase();
 
     if (!fileType || !validTypes.includes(fileType as FileType)) {
-      setError('รองรับเฉพาะไฟล์ .txt, .docx, .pdf เท่านั้น');
+      setError('รองรับเฉพาะไฟล์ .txt, .docx, .pdf, .md เท่านั้น');
       return;
     }
 
@@ -123,6 +150,56 @@ const TextDiffChecker: React.FC = () => {
       setError(errorMessage);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const saveSession = (): void => {
+    if (!text1 || !text2) {
+      setError('กรุณาใส่ข้อความทั้งสองฝั่งก่อนบันทึก');
+      return;
+    }
+
+    const newSession: SavedSession = {
+      timestamp: Date.now(),
+      text1,
+      text2,
+      file1Name: file1?.name,
+      file2Name: file2?.name,
+      ignoreWhitespace,
+      showWhitespace,
+    };
+
+    const updatedSessions = [newSession, ...savedSessions].slice(0, 10); // Keep only last 10 sessions
+    setSavedSessions(updatedSessions);
+    localStorage.setItem('diffCheckerSessions', JSON.stringify(updatedSessions));
+
+    alert('บันทึก Session สำเร็จ!');
+  };
+
+  const loadSession = (session: SavedSession): void => {
+    setText1(session.text1);
+    setText2(session.text2);
+    setIgnoreWhitespace(session.ignoreWhitespace);
+    setShowWhitespace(session.showWhitespace);
+    setFile1(null);
+    setFile2(null);
+    setInputMode1('text');
+    setInputMode2('text');
+    setDiffResult(null);
+
+    computeDiff(session);
+  };
+
+  const deleteSession = (timestamp: number): void => {
+    const updatedSessions = savedSessions.filter(s => s.timestamp !== timestamp);
+    setSavedSessions(updatedSessions);
+    localStorage.setItem('diffCheckerSessions', JSON.stringify(updatedSessions));
+  };
+
+  const clearAllSessions = (): void => {
+    if (confirm('คุณต้องการลบ Session ทั้งหมดหรือไม่?')) {
+      setSavedSessions([]);
+      localStorage.removeItem('diffCheckerSessions');
     }
   };
 
@@ -297,14 +374,16 @@ const TextDiffChecker: React.FC = () => {
     return grouped;
   };
 
-  const computeDiff = (): void => {
-    if (!text1 || !text2) {
+  const computeDiff = (session ?: SavedSession): void => {
+    const t1 = session ? session.text1 : text1;
+    const t2 = session ? session.text2 : text2;
+    if (!t1 || !t2) {
       setError('กรุณาเลือกไฟล์หรือใส่ข้อความทั้งสองฝั่ง');
       return;
     }
 
-    const allLines1 = text1.split('\n');
-    const allLines2 = text2.split('\n');
+    const allLines1 = t1.split('\n');
+    const allLines2 = t2.split('\n');
 
     const lines1WithNum: LineWithNum[] = allLines1.map((line, idx) => ({ line, originalLineNum: idx + 1 }))
       .filter(item => item.line.trim() !== '');
@@ -347,6 +426,13 @@ const TextDiffChecker: React.FC = () => {
     setText: React.Dispatch<React.SetStateAction<string>>
   ): void => {
     setFile(null);
+    setText('');
+    setDiffResult(null);
+    setSearchTerm('');
+    setSearchResults([]);
+  };
+
+  const clearText = (setText: React.Dispatch<React.SetStateAction<string>>): void => {
     setText('');
     setDiffResult(null);
     setSearchTerm('');
@@ -540,12 +626,12 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
           animation: flash 0.5s ease-in-out 3;
         }
       `}</style>
-      
+
       <div className="max-w-7xl mx-auto">
         <div className="bg-white rounded-2xl shadow-xl overflow-hidden">
           <div className="bg-gradient-to-r from-blue-600 to-blue-700 text-white p-6">
             <h1 className="text-3xl font-bold mb-2">Text Diff Checker</h1>
-            <p className="text-blue-100">เปรียบเทียบความแตกต่างแบบ Git-style รองรับ PDF, DOCX, TXT</p>
+            <p className="text-blue-100">เปรียบเทียบความแตกต่างแบบ Git-style รองรับ PDF, DOCX, TXT, MD</p>
           </div>
 
           {error && (
@@ -563,24 +649,55 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
                     <div className="w-2 h-2 bg-red-500 rounded-full"></div>
                     ต้นฉบับ (a)
                   </h3>
-                  {file1 && (
-                    <button onClick={() => removeFile(setFile1, setText1)} className="text-slate-400 hover:text-red-500 transition p-1">
-                      <X size={18} />
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setInputMode1('file')}
+                      className={`text-xs px-2 py-1 rounded ${inputMode1 === 'file' ? 'bg-red-500 text-white' : 'bg-slate-200 text-slate-600'}`}
+                    >
+                      ไฟล์
                     </button>
-                  )}
+                    <button
+                      onClick={() => setInputMode1('text')}
+                      className={`text-xs px-2 py-1 rounded ${inputMode1 === 'text' ? 'bg-red-500 text-white' : 'bg-slate-200 text-slate-600'}`}
+                    >
+                      ข้อความ
+                    </button>
+                  </div>
                 </div>
-                
-                {!file1 ? (
-                  <label className="block border-2 border-dashed border-slate-300 rounded-lg p-6 text-center cursor-pointer hover:border-red-400 hover:bg-red-50 transition">
-                    <input type="file" onChange={(e) => handleFileUpload(e.target.files?.[0], setFile1, setText1)} accept=".txt,.docx,.pdf" className="hidden" />
-                    <Upload className="mx-auto mb-2 text-slate-400" size={32} />
-                    <p className="text-sm text-slate-600">อัปโหลดไฟล์</p>
-                    <p className="text-xs text-slate-500 mt-1">TXT, DOCX, PDF</p>
-                  </label>
+
+                {inputMode1 === 'file' ? (
+                  !file1 ? (
+                    <label className="block border-2 border-dashed border-slate-300 rounded-lg p-6 text-center cursor-pointer hover:border-red-400 hover:bg-red-50 transition">
+                      <input type="file" onChange={(e) => { handleFileUpload(e.target.files?.[0], setFile1, setText1); setInputMode1('file'); }} accept=".txt,.docx,.pdf,.md" className="hidden" />
+                      <Upload className="mx-auto mb-2 text-slate-400" size={32} />
+                      <p className="text-sm text-slate-600">อัปโหลดไฟล์</p>
+                      <p className="text-xs text-slate-500 mt-1">TXT, DOCX, PDF, MD</p>
+                    </label>
+                  ) : (
+                    <div className="border border-slate-200 rounded-lg p-3 bg-white flex items-center gap-3">
+                      <FileText className="text-red-500 flex-shrink-0" size={20} />
+                      <span className="text-sm text-slate-700 truncate flex-1">{file1.name}</span>
+                      <button onClick={() => removeFile(setFile1, setText1)} className="text-slate-400 hover:text-red-500 transition">
+                        <X size={16} />
+                      </button>
+                    </div>
+                  )
                 ) : (
-                  <div className="border border-slate-200 rounded-lg p-3 bg-white flex items-center gap-3">
-                    <FileText className="text-red-500 flex-shrink-0" size={20} />
-                    <span className="text-sm text-slate-700 truncate">{file1.name}</span>
+                  <div className="relative">
+                    <textarea
+                      value={text1}
+                      onChange={(e) => setText1(e.target.value)}
+                      placeholder="วางข้อความที่นี่..."
+                      className="w-full h-32 p-3 text-black border border-slate-300 rounded-lg text-sm font-mono resize-none focus:ring-2 focus:ring-red-400 focus:border-transparent"
+                    />
+                    {text1 && (
+                      <button
+                        onClick={() => clearText(setText1)}
+                        className="absolute top-2 right-2 text-slate-400 hover:text-red-500 transition"
+                      >
+                        <X size={16} />
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
@@ -591,24 +708,55 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
                     <div className="w-2 h-2 bg-green-500 rounded-full"></div>
                     แก้ไขแล้ว (b)
                   </h3>
-                  {file2 && (
-                    <button onClick={() => removeFile(setFile2, setText2)} className="text-slate-400 hover:text-red-500 transition p-1">
-                      <X size={18} />
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setInputMode2('file')}
+                      className={`text-xs px-2 py-1 rounded ${inputMode2 === 'file' ? 'bg-green-500 text-white' : 'bg-slate-200 text-slate-600'}`}
+                    >
+                      ไฟล์
                     </button>
-                  )}
+                    <button
+                      onClick={() => setInputMode2('text')}
+                      className={`text-xs px-2 py-1 rounded ${inputMode2 === 'text' ? 'bg-green-500 text-white' : 'bg-slate-200 text-slate-600'}`}
+                    >
+                      ข้อความ
+                    </button>
+                  </div>
                 </div>
 
-                {!file2 ? (
-                  <label className="block border-2 border-dashed border-slate-300 rounded-lg p-6 text-center cursor-pointer hover:border-green-400 hover:bg-green-50 transition">
-                    <input type="file" onChange={(e) => handleFileUpload(e.target.files?.[0], setFile2, setText2)} accept=".txt,.docx,.pdf" className="hidden" />
-                    <Upload className="mx-auto mb-2 text-slate-400" size={32} />
-                    <p className="text-sm text-slate-600">อัปโหลดไฟล์</p>
-                    <p className="text-xs text-slate-500 mt-1">TXT, DOCX, PDF</p>
-                  </label>
+                {inputMode2 === 'file' ? (
+                  !file2 ? (
+                    <label className="block border-2 border-dashed border-slate-300 rounded-lg p-6 text-center cursor-pointer hover:border-green-400 hover:bg-green-50 transition">
+                      <input type="file" onChange={(e) => { handleFileUpload(e.target.files?.[0], setFile2, setText2); setInputMode2('file'); }} accept=".txt,.docx,.pdf,.md" className="hidden" />
+                      <Upload className="mx-auto mb-2 text-slate-400" size={32} />
+                      <p className="text-sm text-slate-600">อัปโหลดไฟล์</p>
+                      <p className="text-xs text-slate-500 mt-1">TXT, DOCX, PDF, MD</p>
+                    </label>
+                  ) : (
+                    <div className="border border-slate-200 rounded-lg p-3 bg-white flex items-center gap-3">
+                      <FileText className="text-green-500 flex-shrink-0" size={20} />
+                      <span className="text-sm text-slate-700 truncate flex-1">{file2.name}</span>
+                      <button onClick={() => removeFile(setFile2, setText2)} className="text-slate-400 hover:text-red-500 transition">
+                        <X size={16} />
+                      </button>
+                    </div>
+                  )
                 ) : (
-                  <div className="border border-slate-200 rounded-lg p-3 bg-white flex items-center gap-3">
-                    <FileText className="text-green-500 flex-shrink-0" size={20} />
-                    <span className="text-sm text-slate-700 truncate">{file2.name}</span>
+                  <div className="relative">
+                    <textarea
+                      value={text2}
+                      onChange={(e) => setText2(e.target.value)}
+                      placeholder="วางข้อความที่นี่..."
+                      className="w-full h-32 p-3 border border-slate-300 rounded-lg text-sm text-black font-mono resize-none focus:ring-2 focus:ring-green-400 focus:border-transparent"
+                    />
+                    {text2 && (
+                      <button
+                        onClick={() => clearText(setText2)}
+                        className="absolute top-2 right-2 text-slate-400 hover:text-red-500 transition"
+                      >
+                        <X size={16} />
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
@@ -619,17 +767,64 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
                 <input type="checkbox" checked={ignoreWhitespace} onChange={(e) => setIgnoreWhitespace(e.target.checked)} className="w-4 h-4 text-blue-600 rounded" />
                 <span className="text-sm text-slate-700">Ignore whitespace</span>
               </label>
-              
+
               <label className="flex items-center gap-2 cursor-pointer">
                 <input type="checkbox" checked={showWhitespace} onChange={(e) => setShowWhitespace(e.target.checked)} className="w-4 h-4 text-blue-600 rounded" />
                 <span className="text-sm text-slate-700">Show whitespace (· = space, → = tab)</span>
               </label>
             </div>
 
-            <button onClick={computeDiff} disabled={loading || (!text1 || !text2)} className="w-full mt-4 bg-gradient-to-r from-blue-500 to-blue-600 text-white py-3 px-6 rounded-lg font-semibold hover:from-blue-600 hover:to-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition shadow-lg">
-              {loading ? 'กำลังประมวลผล...' : 'เปรียบเทียบ'}
-            </button>
+            <div className="mt-4 flex gap-2">
+              <button onClick={()=> computeDiff()} disabled={loading || (!text1 || !text2)} className="flex-1 bg-gradient-to-r from-blue-500 to-blue-600 text-white py-3 px-6 rounded-lg font-semibold hover:from-blue-600 hover:to-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition shadow-lg">
+                {loading ? 'กำลังประมวลผล...' : 'เปรียบเทียบ'}
+              </button>
+              <button onClick={saveSession} disabled={!text1 || !text2} className="px-6 py-3 bg-green-500 text-white rounded-lg font-semibold hover:bg-green-600 disabled:opacity-50 disabled:cursor-not-allowed transition shadow-lg">
+                บันทึก Session
+              </button>
+            </div>
           </div>
+
+          {savedSessions.length > 0 && (
+            <div className="p-6 bg-slate-50 border-b">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="font-semibold text-slate-700">Session ที่บันทึกไว้</h3>
+                <button onClick={clearAllSessions} className="text-xs text-red-600 hover:text-red-700 underline">
+                  ลบทั้งหมด
+                </button>
+              </div>
+              <div className="space-y-2 max-h-48 overflow-y-auto">
+                {savedSessions.map((session) => (
+                  <div key={session.timestamp} className="bg-white border border-slate-200 rounded-lg p-3 flex items-center justify-between hover:border-blue-400 transition">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 text-xs text-slate-500 mb-1">
+                        <span>{new Date(session.timestamp).toLocaleString('th-TH')}</span>
+                        {session.file1Name && <span className="text-red-600">• {session.file1Name}</span>}
+                        {session.file2Name && <span className="text-green-600">• {session.file2Name}</span>}
+                      </div>
+                      <div className="text-xs text-slate-400 truncate">
+                        {session.text1.substring(0, 50)}... ↔ {session.text2.substring(0, 50)}...
+                      </div>
+                    </div>
+                    <div className="flex gap-2 ml-3">
+                      <button
+                        type='button'
+                        onClick={() => loadSession(session)}
+                        className="px-3 py-1 bg-blue-500 text-white text-xs rounded hover:bg-blue-600 transition"
+                      >
+                        โหลด
+                      </button>
+                      <button
+                        onClick={() => deleteSession(session.timestamp)}
+                        className="px-3 py-1 bg-red-500 text-white text-xs rounded hover:bg-red-600 transition"
+                      >
+                        ลบ
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {diffResult && (
             <div className="p-6">
@@ -642,25 +837,25 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
                       <span className="text-red-600 font-semibold">-{countChanges().removed}</span>
                     </div>
                   </div>
-                  
+
                   <div className="flex gap-2">
-                    <button onClick={exportToHTML} className="flex items-center gap-2 px-3 py-2 bg-green-500 hover:bg-green-300 rounded-lg text-sm transition">
+                    <button onClick={exportToHTML} className="flex items-center text-white gap-2 px-3 py-2 bg-green-500 hover:bg-green-300 rounded-lg text-sm transition">
                       <Download size={16} />
                       <span>Export</span>
                     </button>
-                    <button onClick={copyDiffToClipboard} className="flex items-center gap-2 px-3 py-2 bg-blue-500 hover:bg-blue-300 rounded-lg text-sm transition">
+                    <button onClick={copyDiffToClipboard} className="flex items-center text-white gap-2 px-3 py-2 bg-blue-500 hover:bg-blue-300 rounded-lg text-sm transition">
                       {copied ? <Check size={16} className="text-green-600" /> : <Copy size={16} />}
                       <span>{copied ? 'Copied!' : 'Copy'}</span>
                     </button>
                   </div>
                 </div>
-                
+
                 <div className="flex items-center gap-4 flex-wrap">
                   <div className="relative flex-grow max-w-md">
                     <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-slate-400" size={16} />
                     <input type="text" value={searchTerm} onChange={(e) => handleSearch(e.target.value)} placeholder="ค้นหาในผลลัพธ์..." className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-400 focus:border-transparent" />
                   </div>
-                  
+
                   {searchResults.length > 0 && (
                     <div className="flex items-center gap-3">
                       <span className="text-sm text-slate-600">{currentSearchIndex + 1} / {searchResults.length}</span>
@@ -670,7 +865,7 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
                       </div>
                     </div>
                   )}
-                  
+
                   <div className="flex bg-slate-100 rounded-lg p-1">
                     <button onClick={() => setViewMode('diff')} className={`px-3 py-1.5 rounded text-sm font-medium transition ${viewMode === 'diff' ? 'bg-white text-slate-900 shadow' : 'text-slate-600'}`}>
                       Diff
@@ -682,7 +877,7 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
                       แก้ไขแล้ว
                     </button>
                   </div>
-                  
+
                   {viewMode === 'diff' && (
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input type="checkbox" checked={showOnlyDiff} onChange={(e) => setShowOnlyDiff(e.target.checked)} className="w-4 h-4 text-blue-600 rounded" />
@@ -709,7 +904,7 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
                             ดู context
                           </button>
                         </div>
-                        
+
                         {!showOnlyDiff && hunk.beforeContext.map((line, idx) => (
                           <div key={`before-${idx}`} className="flex hover:bg-slate-800 transition">
                             <div className="px-4 py-1 text-slate-500 font-mono text-xs w-12 text-right flex-shrink-0 select-none border-r border-slate-700">{line.lineNum1}</div>
@@ -717,7 +912,7 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
                             <div className="px-4 py-1 font-mono text-sm text-slate-400 flex-1">{visualizeWhitespace(line.line1 || line.line2)}</div>
                           </div>
                         ))}
-                        
+
                         {hunk.changes.map((change, idx) => (
                           <div key={`change-${idx}`} id={`change-${hunkIdx}-${idx}`} className={`flex ${change.type === 'removed' ? 'bg-red-950' : change.type === 'added' ? 'bg-green-950' : change.type === 'modified' ? 'bg-yellow-950' : ''} hover:brightness-110 transition cursor-pointer`} onClick={() => {
                             const lineNum = change.type === 'removed' ? change.originalLineNum1 : change.originalLineNum2;
@@ -756,7 +951,7 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
                             </div>
                           </div>
                         ))}
-                        
+
                         {!showOnlyDiff && hunk.afterContext.map((line, idx) => (
                           <div key={`after-${idx}`} className="flex hover:bg-slate-800 transition">
                             <div className="px-4 py-1 text-slate-500 font-mono text-xs w-12 text-right flex-shrink-0 select-none border-r border-slate-700">{line.lineNum1}</div>
@@ -806,7 +1001,7 @@ body{font-family:'Courier New',monospace;padding:20px;background:#f5f5f5}
 
               <div className="mt-4 p-4 bg-blue-50 rounded-lg">
                 <p className="text-sm text-slate-700">
-                  <strong>สรุป:</strong> เพิ่ม <span className="font-semibold text-green-600">+{countChanges().added}</span> บรรทัด, 
+                  <strong>สรุป:</strong> เพิ่ม <span className="font-semibold text-green-600">+{countChanges().added}</span> บรรทัด,
                   ลบ <span className="font-semibold text-red-600">-{countChanges().removed}</span> บรรทัด
                 </p>
               </div>
