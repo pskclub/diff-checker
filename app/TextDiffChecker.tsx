@@ -81,7 +81,7 @@ const TextDiffChecker: React.FC = () => {
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [currentSearchIndex, setCurrentSearchIndex] = useState<number>(0);
-  const [ignoreWhitespace, setIgnoreWhitespace] = useState<boolean>(false);
+  const [ignoreWhitespace, setIgnoreWhitespace] = useState<boolean>(true);
   const [showWhitespace, setShowWhitespace] = useState<boolean>(false);
   const [copied, setCopied] = useState<boolean>(false);
   const [inputMode1, setInputMode1] = useState<InputMode>('file');
